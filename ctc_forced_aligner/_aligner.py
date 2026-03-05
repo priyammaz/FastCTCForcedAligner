@@ -1,5 +1,6 @@
 import warnings
 from typing import Callable, Optional
+from concurrent.futures import ThreadPoolExecutor
 from .py_aligner import align_single_py
 from .utils import _to_numpy, _transcript_to_tokens
 
@@ -69,25 +70,28 @@ def align_batch(
     blank_token: int,
     normalize_fn: Optional[Callable[[str], str]] = None,
     fast: bool=True, 
-    return_trellis: bool = False
-):
+    return_trellis: bool = False,
+    num_workers=None
+):  
+    """
+    Simple wrapper to compute each alignment in parallel 
+    """
 
-    assert len(emissions) == len(transcripts), \
-        "each emission should have a cooresponding transcript"
+    assert len(emissions) == len(transcripts)
 
     use_cpp = fast and not return_trellis and _cpp_align_single is not None
 
     if use_cpp:
         emissions_np = [_to_numpy(e) for e in emissions]
-        token_seqs   = [_transcript_to_tokens(t, token_dictionary, blank_token, normalize_fn) for t in transcripts]
-        result = _cpp_align_batch(emissions_np, token_seqs, token_dictionary[blank_token])
-        del emissions_np
-        return result
-    
-    return [
-        align_single_py(
-            e, t, token_dictionary, blank_token,
-            return_trellis=return_trellis,
-        )
-        for e, t in zip(emissions, transcripts)
-    ]
+        token_seqs = [_transcript_to_tokens(t, token_dictionary, blank_token, normalize_fn) for t in transcripts]
+        blank_id = token_dictionary[blank_token]
+        fn = lambda args: _cpp_align_single(args[0], args[1], blank_id)
+    else:
+        fn = lambda args: align_single_py(args[0], args[1], token_dictionary, blank_token, return_trellis=return_trellis)
+        emissions_np = emissions
+        token_seqs = transcripts
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        results = list(pool.map(fn, zip(emissions_np, token_seqs)))
+
+    return results

@@ -7,6 +7,7 @@ import librosa
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from accelerate import Accelerator
+from accelerate.utils import TorchDynamoPlugin
 import torch
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
@@ -23,6 +24,8 @@ from transformers.utils import logging as hf_logging
 warnings.filterwarnings("ignore")
 
 hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar() 
+hf_logging.disable_default_handler()
 logging.getLogger("accelerate").setLevel(logging.ERROR)
 logging.getLogger("torch").setLevel(logging.ERROR)
 
@@ -36,10 +39,42 @@ def default(input, default):
 def _check_in_csv(df, col):
     return col in df.columns
 
-def get_durations(paths, num_workers):
+def get_durations(paths, num_workers, show_progress=True):
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        durations = list(pool.map(lambda p: librosa.get_duration(path=p), paths))
+        durations = list(tqdm(
+            pool.map(lambda p: librosa.get_duration(path=p), paths),
+            total=len(paths),
+            desc="Extracting Audio Durations",
+            bar_format="{l_bar}{bar:35}{r_bar}",
+            colour="cyan",
+            disable=not show_progress,
+        ))
     return durations
+
+def _fmt_duration(seconds):
+    """Format seconds as Xh Xm Xs."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    if h > 0:
+        return f"{h}h {m}m {s:.0f}s"
+    elif m > 0:
+        return f"{m}m {s:.0f}s"
+    return f"{s:.1f}s"
+
+def _print_banner(config: dict):
+    """Print a formatted info banner. Only called from rank 0."""
+    W = 60
+    print()
+    print("┌" + "─" * (W - 2) + "┐")
+    print("│" + "  CTC Forced Aligner".center(W - 2) + "│")
+    print("├" + "─" * (W - 2) + "┤")
+    for key, val in config.items():
+        line = f"  {key:<22}{val}"
+        print("│" + f"{line:<{W-2}}" + "│")
+    print("└" + "─" * (W - 2) + "┘")
+    print()
+
 
 def shard(manifest, world_size):
     """Split a list into world_size roughly equal chunks"""
@@ -164,11 +199,12 @@ class AudioTextAlignment:
     Wrapper on our aligner method with included normalize_fn
     to prepare raw transcripts for the CTC tokenizer
     """
-    def __init__(self, processor, blank_token, normalize_fn=None):
+    def __init__(self, processor, blank_token, normalize_fn=None, num_workers=None):
         self.processor = processor
         self.char_to_id = self.processor.tokenizer.get_vocab()
         self.blank_token = blank_token
         self.normalize_fn = normalize_fn
+        self.num_workers = num_workers
         self.token_dictionary = {i: c for i, c in self.char_to_id.items()}
 
     def process_alignments(
@@ -182,7 +218,7 @@ class AudioTextAlignment:
         return align_batch(batch_emissions, transcripts, 
                            self.token_dictionary, self.blank_token, 
                            normalize_fn=self.normalize_fn,
-                           fast=True)
+                           fast=True, num_workers=self.num_workers)
 
     def __call__(self, batch_emissions, transcripts):
         return self.process_alignments(batch_emissions, transcripts)
@@ -213,7 +249,6 @@ def save(alignment, path_to_audio, transcript, duration, word_alignment=None, ro
     if root is None:
         base_path = os.path.join(audio_dir, audio_stem)
     else:
-        os.makedirs(root, exist_ok=True)
         base_path = os.path.join(root, audio_stem)
 
     alignment_path = base_path + "_alignment.npy"
@@ -315,12 +350,20 @@ class BulkAligner:
         
         ### Where to save alignments ###
         self.save_dir = save_dir
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
 
         ### Text processor ###
         self.normalize_fn = normalize_fn
 
+        ### How mnay workers? ###
+        self.num_workers = num_workers
+
         ### Instantiate Accelerator ###
-        self.accelerator = Accelerator(mixed_precision="fp16" if DTYPE == torch.float16 else "bf16", split_batches=False)
+        dynamo = TorchDynamoPlugin(backend="inductor", dynamic=True)
+        self.accelerator = Accelerator(mixed_precision="fp16" if DTYPE == torch.float16 else "bf16", 
+                                       split_batches=False,
+                                       dynamo_plugin=dynamo if compile_model else None)
         self.world_size = self.accelerator.num_processes
         self.rank = self.accelerator.process_index
 
@@ -332,9 +375,6 @@ class BulkAligner:
         )
         self.model.eval()
 
-        if compile_model:
-            self.model = torch.compile(self.model)
-
         self.model = self.accelerator.prepare(self.model)
         self.processor = AutoProcessor.from_pretrained(ctc_backbone)
         
@@ -342,7 +382,7 @@ class BulkAligner:
         self.emissions_extractor = CTCEmissionExtractor(self.model, self.accelerator)
         
         ### Load Aligner ###
-        self.aligner = AudioTextAlignment(self.processor, blank_token, normalize_fn)
+        self.aligner = AudioTextAlignment(self.processor, blank_token, normalize_fn, num_workers=num_workers)
 
         ### Load Manifest ###
         self.manifest = pd.read_csv(path_to_manifest)
@@ -364,8 +404,8 @@ class BulkAligner:
             if not self.compute_durations:
                 self.durations = self.manifest[self.duration_column].tolist()
             else:
-                self.accelerator.print("Computing Audio Durations for Corpus..")
-                self.durations = get_durations(self.all_paths, num_workers=num_workers)
+                self.durations = get_durations(self.all_paths, num_workers=num_workers, show_progress=self.accelerator.is_main_process)
+            total_hours = sum(self.durations) / 3600
             full_manifest = list(zip(self.all_paths, self.all_transcripts, self.durations))
             shards = shard_by_duration(full_manifest, self.world_size)
 
@@ -377,6 +417,24 @@ class BulkAligner:
         rank_manifest = shards[self.rank]
         rank_paths, rank_transcripts, *_ = zip(*rank_manifest)
 
+        if self.accelerator.is_main_process:
+            dtype_str = "bfloat16" if DTYPE == torch.bfloat16 else "float16"
+            config = {
+                "Model":           ctc_backbone,
+                "Dtype":           dtype_str,
+                "GPUs":            str(self.world_size),
+                "Total files":     f"{len(self.all_paths):,}",
+                "Batch size":      str(batch_size),
+                "Workers":         str(num_workers),
+                "Sort by length":  "yes" if sort_by_longest else "no",
+                "Word alignments": "yes" if return_word_alignments else "no",
+                "Compile model":   "yes" if compile_model else "no",
+                "Save dir":        save_dir or "(alongside audio)",
+            }
+            if total_hours is not None:
+                config["Total audio"] = _fmt_duration(sum(self.durations))
+            _print_banner(config)
+
         ### Prepare DataLoader ###
         total_batches = (len(rank_manifest) + batch_size - 1) // batch_size
         self.rank_pbar = tqdm(
@@ -385,6 +443,8 @@ class BulkAligner:
             position=self.rank,
             leave=True,
             dynamic_ncols=True,
+            colour="green",
+            bar_format="{desc} │{bar:35}│ {n_fmt}/{total_fmt} batches [{elapsed}<{remaining}, {rate_fmt}]",
         )
 
         dataset = AudioDataset(rank_paths, rank_transcripts, self.processor)
@@ -397,25 +457,32 @@ class BulkAligner:
             collate_fn=collate_function(self.processor)
         )        
 
-        self.loader = self.accelerator.prepare(self.loader)
-
     def align(self):
 
-        for inputs, transcripts, paths in self.loader:
-            emissions, time_per_embed  = self.emissions_extractor(inputs)
-            alignments = self.aligner(emissions, transcripts)
-            for a, p, t in zip(alignments, paths, transcripts):
-                d = float(librosa.get_duration(path=p))
-                wa = None
-                if self.return_word_alignments:
-                    t = t.replace("\n", "").strip()
-                    t = self.normalize_fn(t)
-                    wa = get_word_alignments(a,t,time_per_embed,d)
-                save(a,p,t,d,wa,self.save_dir)
+        def process_sample(a, p, t, time_per_embed):
+            d  = float(librosa.get_duration(path=p))
+            t  = t.replace("\n", "").strip()
+            wa = None
+            if self.return_word_alignments:
+                nt = self.normalize_fn(t) if self.normalize_fn else t
+                wa = get_word_alignments(a, nt, time_per_embed, d)
+            save(a, p, t, d, wa, self.save_dir)
 
-            self.rank_pbar.update(1)
+        with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+            for inputs, transcripts, paths in self.loader:
+                emissions, time_per_embed = self.emissions_extractor(inputs)
+                alignments = self.aligner(emissions, transcripts)
 
-        self.accelerator.wait_for_everyone()
+                futures = [
+                    pool.submit(process_sample, a, p, t, time_per_embed)
+                    for a, p, t in zip(alignments, paths, transcripts)
+                ]
+
+                for f in futures:
+                    f.result()
+
+                self.rank_pbar.update(1)
+
         self.rank_pbar.close()
         self.accelerator.end_training()
 

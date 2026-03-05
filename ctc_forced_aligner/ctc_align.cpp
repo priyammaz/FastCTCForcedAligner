@@ -390,11 +390,7 @@ std::vector<std::vector<std::pair<int,int>>> align_batch(
     const int n = static_cast<int>(emissions.size()); // batch size
     std::vector<std::vector<std::pair<int,int>>> results(n); // create a vector to store
 
-    // openmp dynamic will create a queue of operations, each being handed one
-    // one at a time at completion. This is preferrable to static, as different
-    // samples can have different lengths, so they can take different amounts of time
-    // and throw race conditions. 
-    #pragma omp parallel for schedule(dynamic)
+    // apply to each sample one at a time!
     for (int i = 0; i < n; ++i)
         // write as fine as each operation is indexed to i, and performs
         // the write to position i
