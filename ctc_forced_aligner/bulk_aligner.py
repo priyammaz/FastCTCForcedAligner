@@ -108,14 +108,29 @@ def shard_by_duration(manifest, world_size):
 
     return shards
 
+def load_for_inference(path_to_audio, 
+                       processor):
+    """
+    Data prep for single input inference
+    """
+    waveform, sr = torchaudio.load(path_to_audio)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(0, keepdim=True)
+    if sr != SAMPLING_RATE:
+        waveform = torchaudio.transforms.Resample(sr, SAMPLING_RATE)(waveform)
+    values = processor(waveform.squeeze(0), sampling_rate=SAMPLING_RATE).input_values[0]
+    values = torch.tensor(values).unsqueeze(0)
+    return {"input_values": values}
+
 class AudioDataset(Dataset):
     """
     Basic dataset to load audio, resample if necessary, and return
     audio, transcripts and path to audio
     """
-    def __init__(self, paths, transcripts, processor):
+    def __init__(self, paths, transcripts, ids, processor):
         self.paths = paths
         self.transcripts = transcripts
+        self.ids = ids
         self.processor = processor
 
     def __len__(self):
@@ -123,22 +138,19 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.paths[idx]
-        waveform, sr = torchaudio.load(path)
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(0, keepdim=True)
-        if sr != SAMPLING_RATE:
-            waveform = torchaudio.transforms.Resample(sr, SAMPLING_RATE)(waveform)
-        values = self.processor(waveform.squeeze(0), sampling_rate=SAMPLING_RATE).input_values[0]
-        return values, self.transcripts[idx], path
+        values = load_for_inference(path, self.processor, return_type="np")["values"]
+        return values, self.transcripts[idx], path, self.ids[idx]
 
 def collate_function(processor):
     """
     Collate batch of audios together using the Processor
     """
     def _collate_fn(batch):
-        waveforms   = [{"input_values": b[0]} for b in batch]
+        waveforms = [{"input_values": b[0]} for b in batch]
         transcripts = [b[1] for b in batch]
-        paths       = [b[2] for b in batch]
+        paths = [b[2] for b in batch]
+        ids = [b[3] for b in batch]
+
         inputs = processor.pad(
             waveforms,
             padding=True,
@@ -146,29 +158,36 @@ def collate_function(processor):
             pad_to_multiple_of=SAMPLING_RATE,
             return_tensors="pt",
         )
-        return inputs, transcripts, paths
+        return inputs, transcripts, paths, ids
     return _collate_fn
 
 class CTCEmissionExtractor:
     """
     Inference script to get emissions as log probabilities
     """
-    def __init__(self, model, accelerator):
+    def __init__(self, model, accelerator=None):
         self.model = model
         self.accelerator = accelerator
+        self.device = self.accelerator.device if accelerator else (str(next(model.parameters()).device))
 
     @torch.inference_mode()
     def __call__(self, inputs):
 
         ### Inference Model ###
-        inputs = {k: v.to(self.accelerator.device, non_blocking=True) for k, v in inputs.items()}        
+        inputs = {k: v.to(self.device, non_blocking=True) for k, v in inputs.items()}        
         logits = self.model(**inputs).logits
 
         ### Get True (unpadded) audio lengths ###
-        audio_lengths = inputs["attention_mask"].sum(dim=-1)
+        if "attention_mask" in inputs.keys():
+            audio_lengths = inputs["attention_mask"].sum(dim=-1)
+        else:
+            audio_lengths = torch.tensor([inputs["input_values"].shape[-1]])
 
         ### Get true encoded lengths ###
-        encoded_lengths = self.accelerator.unwrap_model(self.model)._get_feat_extract_output_lengths(audio_lengths)
+        if self.accelerator is not None:
+            encoded_lengths = self.accelerator.unwrap_model(self.model)._get_feat_extract_output_lengths(audio_lengths)
+        else:
+            encoded_lengths = self.model._get_feat_extract_output_lengths(audio_lengths)
         
         ### Get the number of audio samples each embedding represents (dowsample factors ~320) ###
         samples_per_embed = math.floor(((audio_lengths / encoded_lengths))[0])
@@ -189,8 +208,12 @@ class CTCEmissionExtractor:
             emissions.append(log_probs.to("cpu", non_blocking=True))
 
         ### Dont continue until all non_blocking ops are done ###
-        if self.accelerator.device.type == "cuda":
+        if "cuda" in self.device:
             torch.cuda.synchronize()
+
+        ### Unpack for single inference ###
+        if len(emissions) == 1:
+            emissions = emissions[0]
 
         return emissions, time_per_embed
 
@@ -223,7 +246,12 @@ class AudioTextAlignment:
     def __call__(self, batch_emissions, transcripts):
         return self.process_alignments(batch_emissions, transcripts)
 
-def save(alignment, path_to_audio, transcript, duration, word_alignment=None, root=None):
+def save(alignment, 
+         path_to_audio, 
+         transcript, duration, 
+         word_alignment=None, 
+         root=None,
+         file_id=None):
 
     """
     Quick save method. Creates a json file as :
@@ -244,12 +272,8 @@ def save(alignment, path_to_audio, transcript, duration, word_alignment=None, ro
     """
 
     audio_dir = os.path.dirname(path_to_audio)
-    audio_stem = os.path.splitext(os.path.basename(path_to_audio))[0]
-
-    if root is None:
-        base_path = os.path.join(audio_dir, audio_stem)
-    else:
-        base_path = os.path.join(root, audio_stem)
+    stem       = str(file_id) if file_id is not None else os.path.splitext(os.path.basename(path_to_audio))[0]
+    base_path  = os.path.join(root if root is not None else audio_dir, stem)
 
     alignment_path = base_path + "_alignment.npy"
     np.save(alignment_path, np.array(alignment))
@@ -274,9 +298,10 @@ def get_word_alignments(
     char_alignments,
     transcript,
     time_per_embed,
-    audio_duration
+    audio_duration,
+    blank_token="|",
 ):
-    token_str = '|'.join(transcript.split()).upper()
+    token_str = blank_token.join(transcript.split()).upper()
 
     assert len(char_alignments) == len(token_str), (
         f"Alignment length {len(char_alignments)} != token string length {len(token_str)}"
@@ -287,7 +312,7 @@ def get_word_alignments(
     current_word_spans = []
 
     for char, span in zip(token_str, char_alignments):
-        if char == '|':
+        if char == blank_token:
             if current_word_chars:
                 words.append({
                     "word":  ''.join(current_word_chars),
@@ -317,6 +342,7 @@ class BulkAligner:
 
     Args:
         path_to_manifest: Path to csv file that contains paths to audio, transcripts and optionally durations
+        save_dir: Where do you want to save outputs?
         ctc_backbone: Huggingface Wav2Vec2 Backbone to use, Default -> facebook/wav2vec2-base-960h
         batch_size: Num samples per GPU, Default -> 16
         blank_token: CTC Blank Token, Default -> "|"
@@ -324,13 +350,14 @@ class BulkAligner:
         path_to_audio_column: Name of audio column in manifest, Default -> "path_to_audio"
         transcript_column: Name of transcript column in manifest, Default -> "transcript"
         duration_column: Name of (optional) duration column in manifest, Default -> "duration"
+        id_column: Name of (optional) name column you want to use as id for audio, Default -> "id"
         sort_by_longest: Sort batches to process longest to shrotest to avoid excess wasted padding operations
         num_workers: How many workers for different operations?
         compile_model: Do you want to use torch.compile to speed up inference?
-        save_dir: Where do you want to save outputs, if None, will be saved alongside audio files
     """
     def __init__(self, 
                  path_to_manifest,
+                 save_dir,
                  return_word_alignments=False,
                  ctc_backbone="facebook/wav2vec2-base-960h",
                  batch_size=16,
@@ -339,10 +366,10 @@ class BulkAligner:
                  path_to_audio_column=None, 
                  transcript_column=None,
                  duration_column=None,
+                 id_column=None,
                  sort_by_longest=True,
                  num_workers=8,
-                 compile_model=False,
-                 save_dir=None
+                 compile_model=False
             ):
         
         ### Do you want word alignments? ###
@@ -391,14 +418,16 @@ class BulkAligner:
         self.paths_col = default(path_to_audio_column, "path_to_audio")
         self.transcripts_col = default(transcript_column, "transcript")
         self.duration_column = default(duration_column, "duration")
+        self.id_column = default(id_column, "id")
         
         assert _check_in_csv(self.manifest, self.paths_col), f"{self.paths_col} not found in {self.manifest.columns}"
         assert _check_in_csv(self.manifest, self.transcripts_col), f"{self.transcripts_col} not found in {self.manifest.columns}"
         self.compute_durations = not _check_in_csv(self.manifest, self.duration_column)
-
+        
         ### Grab Paths, Transcripts and Durations (optionally) ###
         self.all_paths = self.manifest[self.paths_col].tolist()
         self.all_transcripts = self.manifest[self.transcripts_col].tolist()
+        self.all_ids = self.manifest[self.id_column].tolist() if self.id_column and _check_in_csv(self.manifest, self.id_column) else None
 
         if sort_by_longest:
             if not self.compute_durations:
@@ -406,16 +435,19 @@ class BulkAligner:
             else:
                 self.durations = get_durations(self.all_paths, num_workers=num_workers, show_progress=self.accelerator.is_main_process)
             total_hours = sum(self.durations) / 3600
-            full_manifest = list(zip(self.all_paths, self.all_transcripts, self.durations))
+            full_manifest = list(zip(self.all_paths, self.all_transcripts, self.durations, 
+                             self.all_ids or [None]*len(self.all_paths)))
             shards = shard_by_duration(full_manifest, self.world_size)
 
         else:
-            full_manifest = list(zip(self.all_paths, self.all_transcripts))
+            full_manifest = list(zip(self.all_paths, self.all_transcripts, 
+                             self.all_ids or [None]*len(self.all_paths)))
             shards = shard(full_manifest, self.world_size)
         
         ### Get shard for this worker ###
         rank_manifest = shards[self.rank]
-        rank_paths, rank_transcripts, *_ = zip(*rank_manifest)
+        rank_paths, rank_transcripts, *rest = zip(*rank_manifest)
+        rank_ids = rest[-1] if self.all_ids else [None] * len(rank_paths)
 
         if self.accelerator.is_main_process:
             dtype_str = "bfloat16" if DTYPE == torch.bfloat16 else "float16"
@@ -447,7 +479,7 @@ class BulkAligner:
             bar_format="{desc} │{bar:35}│ {n_fmt}/{total_fmt} batches [{elapsed}<{remaining}, {rate_fmt}]",
         )
 
-        dataset = AudioDataset(rank_paths, rank_transcripts, self.processor)
+        dataset = AudioDataset(rank_paths, rank_transcripts, rank_ids, self.processor)
         self.loader = DataLoader(
             dataset, 
             batch_size=batch_size, 
@@ -459,23 +491,23 @@ class BulkAligner:
 
     def align(self):
 
-        def process_sample(a, p, t, time_per_embed):
+        def process_sample(a, p, t, time_per_embed, file_id):
             d  = float(librosa.get_duration(path=p))
             t  = t.replace("\n", "").strip()
             wa = None
             if self.return_word_alignments:
                 nt = self.normalize_fn(t) if self.normalize_fn else t
                 wa = get_word_alignments(a, nt, time_per_embed, d)
-            save(a, p, t, d, wa, self.save_dir)
+            save(a, p, t, d, wa, self.save_dir, file_id)
 
         with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
-            for inputs, transcripts, paths in self.loader:
+            for inputs, transcripts, paths, ids in self.loader:
                 emissions, time_per_embed = self.emissions_extractor(inputs)
                 alignments = self.aligner(emissions, transcripts)
 
                 futures = [
-                    pool.submit(process_sample, a, p, t, time_per_embed)
-                    for a, p, t in zip(alignments, paths, transcripts)
+                    pool.submit(process_sample, a, p, t, time_per_embed, i)
+                    for a, p, t, i in zip(alignments, paths, transcripts, ids)
                 ]
 
                 for f in futures:

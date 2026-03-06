@@ -52,7 +52,9 @@ def build_parser():
     # Required
     p.add_argument("--manifest", required=True,
                    help="Path to CSV manifest file.")
-
+    p.add_argument("--save-dir", required=True,
+                   help="Output directory. Defaults to alongside each audio file.")
+    
     # Distributed override
     p.add_argument("--num-processes", type=int, default=None,
                    help="Number of GPUs. If not set, uses accelerate config.")
@@ -88,9 +90,7 @@ def build_parser():
     p.add_argument("--no-sort",     action="store_true",
                    help="Disable longest-first duration sorting.")
 
-    # Output
-    p.add_argument("--save-dir", default=None,
-                   help="Output directory. Defaults to alongside each audio file.")
+    
 
     return p
 
