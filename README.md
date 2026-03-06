@@ -8,6 +8,12 @@ CTC Emission Matricies are extracted from Huggingface 🤗 Wav2Vec2 models and t
 - **C++ Extension** for fast single and batch alignments
 - **CLI** interface for each useage
 
+## Purpose
+
+I got tired of waiting for forced alignment to finish on **thousands of hours of audio**, so this tool exists to make bulk CTC alignment fast and scalable.  
+
+For example, it can process the **entire 960-hour LibriSpeech dataset in ~12 minutes** on a **2× NVIDIA A6000** system!
+
 ## Installation
 
 ```bash
