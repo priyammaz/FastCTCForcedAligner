@@ -38,7 +38,7 @@ setup(
     ],
     entry_points={
     "console_scripts": [
-        "ctc-align=ctc_forced_aligner.cli:main",
+        "bulk-align=ctc_forced_aligner.cli:main",
         ],
     },
 )
