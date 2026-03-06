@@ -5,15 +5,13 @@ import numpy as np
 ext = Pybind11Extension(
     "ctc_forced_aligner._ctc_align_cpp",
     sources=["ctc_forced_aligner/ctc_align.cpp"],
-    include_dirs=[np.get_include()],   # ← add this
+    include_dirs=[np.get_include()],
     extra_compile_args=[
         "-O3",
         "-march=native",   
         "-funroll-loops",
         "-ffast-math",    
-        "-fopenmp",
     ],
-    extra_link_args=["-fopenmp"],
     language="c++",
     cxx_std=17,
 )
