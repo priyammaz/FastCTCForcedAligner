@@ -272,8 +272,8 @@ def save(alignment,
     """
 
     audio_dir = os.path.dirname(path_to_audio)
-    stem       = str(file_id) if file_id is not None else os.path.splitext(os.path.basename(path_to_audio))[0]
-    base_path  = os.path.join(root if root is not None else audio_dir, stem)
+    stem = str(file_id) if file_id is not None else os.path.splitext(os.path.basename(path_to_audio))[0]
+    base_path = os.path.join(root if root is not None else audio_dir, stem)
 
     alignment_path = base_path + "_alignment.npy"
     np.save(alignment_path, np.array(alignment))
