@@ -1,5 +1,8 @@
 # FastCTCForcedAligner
 
+<img src="https://github.com/priyammaz/FastCTCForcedAligner/blob/main/vis/trellis.png?raw=true" alt="drawing" width="500"/>
+
+
 Forced alignment is a key preprocessing step in Speech Research to time align text to cooresponding audio. This repository provides a fast CTC-Based Force aligner with a C++ Backend on multiple GPUs, to enable bulk force alignment. 
 
 CTC Emission Matricies are extracted from Huggingface 🤗 Wav2Vec2 models and the force alignment finds the exact frame level time of every character and word in the audio. This package provides:
