@@ -45,7 +45,6 @@ def get_durations(paths, num_workers, show_progress=True):
             pool.map(lambda p: librosa.get_duration(path=p), paths),
             total=len(paths),
             desc="Extracting Audio Durations",
-            bar_format="{l_bar}{bar:35}{r_bar}",
             colour="cyan",
             disable=not show_progress,
         ))
@@ -138,7 +137,7 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.paths[idx]
-        values = load_for_inference(path, self.processor, return_type="np")["values"]
+        values = load_for_inference(path, self.processor)["input_values"].squeeze(0)
         return values, self.transcripts[idx], path, self.ids[idx]
 
 def collate_function(processor):
@@ -168,7 +167,7 @@ class CTCEmissionExtractor:
     def __init__(self, model, accelerator=None):
         self.model = model
         self.accelerator = accelerator
-        self.device = self.accelerator.device if accelerator else (str(next(model.parameters()).device))
+        self.device = str(self.accelerator.device) if accelerator else (str(next(model.parameters()).device))
 
     @torch.inference_mode()
     def __call__(self, inputs):
@@ -490,7 +489,7 @@ class BulkAligner:
         )        
 
     def align(self):
-
+        
         def process_sample(a, p, t, time_per_embed, file_id):
             d  = float(librosa.get_duration(path=p))
             t  = t.replace("\n", "").strip()

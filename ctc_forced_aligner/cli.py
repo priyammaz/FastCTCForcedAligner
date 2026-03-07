@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 def _normalize(text: str) -> str:
-    """Default normalization for Wav2Vec2 — uppercase letters and spaces only."""
+    """Default normalization for Wav2Vec2 uppercase letters and spaces only."""
     return re.sub(r"[^A-Za-z ]", "", text).upper()
 
 def _is_launched() -> bool:
@@ -91,7 +91,6 @@ def build_parser():
                    help="Disable longest-first duration sorting.")
 
     
-
     return p
 
 
